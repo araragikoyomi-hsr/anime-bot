@@ -12,10 +12,12 @@ from typing import Optional
 
 import aiohttp
 
-from mal import Entry, Plan, PlanItem, expected_titles, titles_match
+from mal import MAX_TERMS, Entry, Plan, PlanItem, expected_titles, titles_match
 
 VIDEO_EXT = (".mp4", ".mkv")
 SRC_RE = re.compile(r"Source title: (.+)$")
+SPECIAL_TAG_RE = re.compile(r"\[mal-(\d+)-e(\d+)\]")
+MAX_SPECIAL_PROBES = 6     # (search term, result pick) combos tried before giving up on an OVA
 
 
 # ------------------------------------------------------------------- config
@@ -92,14 +94,19 @@ def search_term(s: str) -> str:
 
 
 def search_terms(e: Entry, override: Optional[str] = None) -> list:
+    """English title first, then MAL's default title, then other Latin-script synonyms."""
     if override:
         return [override]
-    terms = []
-    for t in (e.title_en, e.title):          # English first, then MAL's default title
-        if t:
-            t = search_term(t)
-            if t and t not in terms:
-                terms.append(t)
+    terms, seen = [], set()
+    for t in (e.title_en, e.title, *e.titles):
+        if not t or not t.isascii():           # the source can't search kanji/kana titles
+            continue
+        t = search_term(t)
+        if t and t.casefold() not in seen and len(t) <= 80:
+            seen.add(t.casefold())
+            terms.append(t)
+        if len(terms) >= MAX_TERMS:
+            break
     return terms
 
 
@@ -143,6 +150,28 @@ def movie_target(cfg: Config, item: PlanItem):
     return cfg.movies_dir / folder_name(name, year), name, year
 
 
+def specials_target(cfg: Config, item: PlanItem):
+    name, year = resolve_folder(cfg.anime_dir, item.series, item.year)
+    return cfg.anime_dir / folder_name(name, year) / "Specials", name, year
+
+
+def special_eps(d: Path, mal_id: int) -> dict:
+    """{source episode: video file} already filed in Specials for this MAL entry.
+    Files carry a [mal-<id>-e<n>] tag so this stays correct if S00 numbering shifts."""
+    out: dict = {}
+    if d.is_dir():
+        for f in d.iterdir():
+            if f.is_file() and f.suffix.lower() in VIDEO_EXT:
+                m = SPECIAL_TAG_RE.search(f.name)
+                if m and int(m.group(1)) == mal_id:
+                    out[int(m.group(2))] = f
+    return out
+
+
+def special_want(e: Entry) -> Optional[int]:
+    return e.episodes or (1 if e.status == "Finished Airing" else None)
+
+
 def count_videos(d: Path) -> int:
     if not d.is_dir():
         return 0
@@ -166,6 +195,8 @@ def library_state(cfg: Config, item: PlanItem):
         return (1 if count_videos(movie_target(cfg, item)[0]) else 0), 1
     if item.kind == "season":
         return count_videos(season_dir(cfg, item)), item.entry.episodes
+    if item.kind == "special":
+        return len(special_eps(specials_target(cfg, item)[0], item.entry.mal_id)), special_want(item.entry)
     return 0, None
 
 
@@ -216,11 +247,12 @@ def _failure_note(tail: deque) -> str:
     return lines[-1][:120] if lines else "no output from anime-dl"
 
 
-def _base_args(job: Job, name: str, year: Optional[int], season: int, term: str, episodes: str) -> list:
+def _base_args(job: Job, name: str, year: Optional[int], season: int, term: str, episodes: str,
+               pick: Optional[int] = None) -> list:
     args = ["-n", name]
     if year:
         args += ["-y", str(year)]
-    args += ["-s", str(season), "-Q", term, "-S", str(job.pick), "-e", episodes, "-q", job.quality]
+    args += ["-s", str(season), "-Q", term, "-S", str(pick or job.pick), "-e", episodes, "-q", job.quality]
     if job.dub:
         args.append("--dub")
     return args
@@ -230,6 +262,8 @@ def _base_args(job: Job, name: str, year: Optional[int], season: int, term: str,
 async def download_item(cfg: Config, job: Job, item: PlanItem) -> None:
     if item.kind == "movie":
         await _download_movie(cfg, job, item)
+    elif item.kind == "special":
+        await _download_special(cfg, job, item)
     else:
         await _download_season(cfg, job, item)
 
@@ -382,6 +416,138 @@ async def _download_movie(cfg: Config, job: Job, item: PlanItem) -> None:
     else:
         r.status, r.note = "failed", _failure_note(tail)
     shutil.rmtree(stage_base / folder, ignore_errors=True)
+
+
+def _file_specials(item: PlanItem, series: str, dest: Path, scratch: Path, stem: str) -> int:
+    """Move finished episodes from the scratch library into <series>/Specials as S00Exx.
+
+    anime-dl only ever writes SxxEyy names for the show it was told about, so each OVA is
+    downloaded as "season 1" of a throw-away show (stem) and renamed here. Numbers start after
+    the earlier specials of the series; if that slot is taken they continue after the highest.
+    """
+    e = item.entry
+    src = scratch / "Season 01"
+    if not src.is_dir():
+        return 0
+    by_ep: dict = {}
+    for f in sorted(src.iterdir()):
+        m = re.fullmatch(re.escape(stem) + r" - S01E(\d+)(\..+)", f.name)
+        if m and f.is_file():
+            by_ep.setdefault(int(m.group(1)), []).append((f, m.group(2)))
+    if not by_ep:
+        return 0
+    dest.mkdir(parents=True, exist_ok=True)
+    have = special_eps(dest, e.mal_id)
+    taken = present_episodes(dest)
+    title = clean_name(e.display)[:100]
+    moved = 0
+    for n in sorted(by_ep):
+        files = by_ep[n]
+        if n in have:                                   # already filed earlier: drop the duplicate
+            for f, _ in files:
+                f.unlink(missing_ok=True)
+            continue
+        if not any(f.suffix.lower() in VIDEO_EXT for f, _ in files):
+            continue
+        num = item.ep_offset + n
+        if num in taken:
+            num = max(taken) + 1
+        taken.add(num)
+        label = f"{title} Ep {n}" if (e.episodes or 0) > 1 else title
+        for f, suffix in files:
+            target = dest / f"{series} - S00E{num:02d} - {label} [mal-{e.mal_id}-e{n}]{suffix}"
+            shutil.move(str(f), str(target))
+        moved += 1
+    return moved
+
+
+async def _download_special(cfg: Config, job: Job, item: PlanItem) -> None:
+    """OVAs / specials: download via a scratch library, verify the source title, file as S00."""
+    e = item.entry
+    r = job.results[e.mal_id]
+    dest, series, _ = specials_target(cfg, item)
+    r.want = special_want(e)
+    r.have = len(special_eps(dest, e.mal_id))
+    if is_complete(r.have, r.want, e.status):
+        r.status, r.note = "done", "already in library"
+        return
+
+    base = cfg.work_dir / "specials"
+    stem = f"mal-{e.mal_id}"                       # throw-away show name inside the scratch library
+    scratch = base / stem
+    base.mkdir(parents=True, exist_ok=True)
+    _file_specials(item, series, dest, scratch, stem)      # rescue leftovers from an interrupted run
+
+    expected = expected_titles(e)
+    override = job.search if len(job.items) == 1 else None
+    terms = search_terms(e, override)
+    picks = [job.pick] + ([job.pick + 1, job.pick + 2] if job.pick == 1 and not override else [])
+    candidates = [(t, p) for p in picks for t in terms][:MAX_SPECIAL_PROBES]
+    tail: deque = deque(maxlen=25)
+    mismatch: Optional[str] = None
+    chosen = None
+
+    def missing() -> list:
+        have = special_eps(dest, e.mal_id)
+        if r.want:
+            return [n for n in range(1, r.want + 1) if n not in have]
+        return [max(have, default=0) + 1]
+
+    todo = missing()
+    if not todo:                                   # still-airing special that already has every listed episode
+        r.status, r.note = "done", "already in library"
+        return
+    if job.verify:
+        for term, pick in candidates:
+            if job.cancelled:
+                break
+            ep = todo[0]
+            shutil.rmtree(scratch, ignore_errors=True)
+            titles: list = []
+            await _run(cfg, job, _base_args(job, stem, None, 1, term, str(ep), pick),
+                       {"ANIME_BASE": str(base), "ANIME_RETRIES": "1"}, tail, titles)
+            got = (scratch / "Season 01")
+            files = sorted(got.glob(f"*S01E{ep:02d}*")) if got.is_dir() else []
+            src = titles[-1] if titles else None
+            if files and (src is None or titles_match(src, expected)):
+                chosen = (term, pick)
+                if src is None:
+                    r.note = "unverified: update anime-dl so it reports the source title"
+                break
+            if files and src:
+                mismatch = src
+            shutil.rmtree(scratch, ignore_errors=True)
+    elif candidates:
+        chosen = candidates[0]
+
+    if chosen and not job.cancelled:
+        term, pick = chosen
+        if r.want:
+            spec = ",".join(str(n) for n in todo)
+        else:
+            spec = f"{todo[0]}-"
+        await _run(cfg, job, _base_args(job, stem, None, 1, term, spec, pick),
+                   {"ANIME_BASE": str(base), "ANIME_RETRIES": "3"}, tail)
+    _file_specials(item, series, dest, scratch, stem)
+
+    r.have = len(special_eps(dest, e.mal_id))
+    r.tail = list(tail)[-8:]
+    if job.cancelled:
+        r.status = "cancelled"
+    elif r.want and r.have >= r.want:
+        r.status = "done"
+        shutil.rmtree(scratch, ignore_errors=True)
+    elif r.have > 0 and not r.want and chosen:
+        r.status = "done"
+        shutil.rmtree(scratch, ignore_errors=True)
+    elif r.have > 0:
+        r.status, r.note = "partial", "some episodes missing"
+    elif job.verify and not chosen and mismatch:
+        r.status = "failed"
+        r.note = (f"wrong show? source returned “{mismatch}” after {len(candidates)} tries "
+                  f"(set pick/search, or verify:False to force)")
+    else:
+        r.status, r.note = "failed", _failure_note(tail)
 
 
 # ----------------------------------------------------------------- jellyfin
