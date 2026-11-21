@@ -98,7 +98,10 @@ ICONS = {"queued": "⏳", "running": "⬇️", "done": "✅", "partial": "⚠️
 def item_label(it, plan: Plan) -> str:
     if it.kind == "movie":
         return "Movie"
-    multi = len({p.series for p in plan.items if p.kind == "season"}) > 1
+    multi = len({p.series for p in plan.items if p.kind in ("season", "special")}) > 1
+    if it.kind == "special":
+        label = it.entry.type or "Special"
+        return f"{it.series} {label}" if multi else label
     return f"{it.series} S{it.season:02d}" if multi else f"S{it.season:02d}"
 
 
@@ -107,7 +110,7 @@ def render_job(job: Job) -> discord.Embed:
     for it in job.items:
         r: ItemResult = job.results[it.entry.mal_id]
         count = ""
-        if it.kind == "season" and (r.have or r.want):
+        if it.kind in ("season", "special") and (r.have or r.want):
             count = f" · {r.have}/{r.want or '?'}"
         note = f" — {r.note}" if r.note else ""
         lines.append(f"{ICONS[r.status]} **{item_label(it, job.plan)}** {it.entry.display}{count}{note}")
@@ -216,12 +219,19 @@ def prepare(entries: list, truncated: bool, focus_id: int, mode: str):
     """Build the plan, look at the library, and pick the default selection:
     the linked entry and everything after it, minus what you already have."""
     plan = build_plan(entries, focus_id, truncated, mode)
+    focus = next((p for p in plan.items if p.entry.mal_id == focus_id), None)
+    focus_is_special = bool(focus and focus.kind == "special")
     states, selected, reached = {}, set(), False
     for p in plan.items:
         reached = reached or p.entry.mal_id == focus_id
         states[p.entry.mal_id] = jobs.library_state(cfg, p)
         have, want = states[p.entry.mal_id]
-        if p.kind != "skip" and reached and not jobs.is_complete(have, want, p.entry.status):
+        if p.kind == "skip" or jobs.is_complete(have, want, p.entry.status):
+            continue
+        if focus_is_special:                 # they linked one OVA/special: just that one
+            if p.entry.mal_id == focus_id:
+                selected.add(p.entry.mal_id)
+        elif reached and p.kind != "special":   # other specials are opt-in via the button
             selected.add(p.entry.mal_id)
     return plan, states, selected
 
@@ -231,7 +241,7 @@ def preview_embed(plan: Plan, states: dict, selected: set, opts: Opts) -> discor
     for p in plan.items:
         e = p.entry
         if p.kind == "skip":
-            why = "not aired yet" if e.status == "Not yet aired" else "skipped"
+            why = "not aired yet" if e.status == "Not yet aired" else f"{e.type or 'unknown'} type isn't downloadable"
             lines.append(f"▫️ ~~{e.type or '?'} · {e.display}~~ ({why})")
             continue
         have, want = states[e.mal_id]
@@ -259,6 +269,7 @@ class PreviewView(discord.ui.View):
         super().__init__(timeout=600)
         self.owner, self.entries, self.truncated = owner, entries, truncated
         self.plan, self.opts, self.channel_id = plan, opts, channel_id
+        self.states = states
         self.selected = set(selected)
 
         options = []
@@ -280,6 +291,11 @@ class PreviewView(discord.ui.View):
         split = build_plan(entries, plan.focus_id, truncated, "split")
         self.layout_btn.label = "Layout: split by title" if plan.mode == "split" else "Layout: one series"
         self.layout_btn.disabled = len({p.series for p in split.items if p.kind == "season"}) <= 1
+        self.specials_btn.disabled = not self._pending_specials()
+
+    def _pending_specials(self) -> set:
+        return {p.entry.mal_id for p in self.plan.selectable if p.kind == "special"
+                and not jobs.is_complete(*self.states[p.entry.mal_id], p.entry.status)}
 
     async def _owner_only(self, interaction: discord.Interaction) -> bool:
         if interaction.user.id != self.owner:
@@ -313,6 +329,20 @@ class PreviewView(discord.ui.View):
         if position > 1:
             await bot.get_partial_messageable(self.channel_id).send(
                 f"Job #{job.id} is #{position} in the queue.")
+
+    @discord.ui.button(label="OVAs/specials", style=discord.ButtonStyle.primary, emoji="🎞️", row=1)
+    async def specials_btn(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
+        if not await self._owner_only(interaction):
+            return
+        ids = self._pending_specials()
+        if ids <= self.selected:
+            self.selected -= ids            # all already on: toggle them off
+        else:
+            self.selected |= ids
+        for opt in self.select.options:
+            opt.default = int(opt.value) in self.selected
+        await interaction.response.edit_message(
+            embed=preview_embed(self.plan, self.states, self.selected, self.opts), view=self)
 
     @discord.ui.button(label="Layout", style=discord.ButtonStyle.primary, row=1)
     async def layout_btn(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
@@ -364,7 +394,7 @@ async def show_preview(msg, owner: int, channel_id: int, mal_id: int, opts: Opts
         return
     plan, states, selected = prepare(entries, truncated, mal_id, "split")
     if not plan.selectable:
-        await msg.edit(content="Nothing downloadable here (only OVAs/specials or unaired entries).",
+        await msg.edit(content="Nothing downloadable here (everything found is unaired or not a downloadable type).",
                        embed=None, view=None)
         return
     view = PreviewView(owner, entries, truncated, plan, states, selected, opts, channel_id)

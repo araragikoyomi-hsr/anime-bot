@@ -23,6 +23,12 @@ ANILIST_RE = re.compile(r"anilist\.co/anime/(\d+)", re.I)
 
 MAX_ENTRIES = 40          # safety cap for huge franchises
 MAX_SELECTABLE = 25       # Discord dropdown limit
+MAX_EXTRA_FETCH = 20      # side-story / "other" candidates looked up per franchise
+MAX_TERMS = 3             # search terms tried per entry (each wrong-show probe costs a download)
+
+SPECIAL_TYPES = {"OVA", "Special"}          # filed under Specials (season 0)
+# MAL relations that can lead to OVAs/specials but aren't Prequel/Sequel links
+EXTRA_RELATIONS = ("Side story", "Other")
 
 
 class MalError(Exception):
@@ -40,8 +46,11 @@ class Entry:
     aired_from: str                 # ISO date, "" if unknown (used for ordering)
     status: str                     # "Finished Airing", "Currently Airing", ...
     image: Optional[str] = None
-    relations: list = field(default_factory=list)   # [(relation, mal_id)]
+    relations: list = field(default_factory=list)   # [(relation, mal_id)] Prequel/Sequel only
     titles: list = field(default_factory=list)      # every known title / synonym
+    extras: list = field(default_factory=list)      # [(relation, mal_id)] side stories / other
+    parents: list = field(default_factory=list)     # [mal_id] "Parent story" links
+    parent_id: Optional[int] = None                 # backbone entry this OVA/special belongs to
 
     @property
     def display(self) -> str:
@@ -56,12 +65,19 @@ def parse_entry(d: dict) -> Entry:
     elif d.get("year"):
         year = int(d["year"])
 
-    rels = []
+    rels, extras, parents = [], [], []
     for rel in d.get("relations") or []:
-        if rel.get("relation") in ("Prequel", "Sequel"):
-            for e in rel.get("entry") or []:
-                if e.get("type") == "anime":
-                    rels.append((rel["relation"], int(e["mal_id"])))
+        name = rel.get("relation")
+        for e in rel.get("entry") or []:
+            if e.get("type") != "anime":
+                continue
+            rid = int(e["mal_id"])
+            if name in ("Prequel", "Sequel"):
+                rels.append((name, rid))
+            elif name in EXTRA_RELATIONS:
+                extras.append((name, rid))
+            elif name == "Parent story":
+                parents.append(rid)
 
     image = (((d.get("images") or {}).get("jpg")) or {}).get("image_url")
     return Entry(
@@ -76,6 +92,8 @@ def parse_entry(d: dict) -> Entry:
         image=image,
         relations=rels,
         titles=[t["title"] for t in (d.get("titles") or []) if t.get("title")],
+        extras=extras,
+        parents=parents,
     )
 
 
@@ -154,9 +172,15 @@ class Tenrai:
         return "search", await self.search(text)
 
     async def franchise(self, start_id: int):
-        """Every entry connected to start_id by Prequel/Sequel links, oldest first."""
+        """Every entry connected to start_id, oldest first.
+
+        The backbone is the Prequel/Sequel chain. OVAs and specials are usually attached by
+        other relations (Side story / Other / Parent story), so those are looked up too and
+        kept only if they turn out to be OVA/Special/TV Special entries.
+        """
         seen: dict[int, Entry] = {}
         todo = [start_id]
+        candidates: list = []          # (relation, mal_id, found_from)
         truncated = False
         while todo:
             mid = todo.pop(0)
@@ -172,6 +196,28 @@ class Tenrai:
                 continue
             seen[mid] = e
             todo.extend(rid for _, rid in e.relations if rid not in seen)
+            if mid == start_id and e.type in (SPECIAL_TYPES | {"TV Special"}):
+                # started from an OVA/special: walk up to the series it belongs to
+                todo.extend(pid for pid in e.parents if pid not in seen)
+            candidates.extend((rel, rid, mid) for rel, rid in e.extras if rid not in seen)
+
+        fetched = 0
+        for rel, rid, found_from in sorted(candidates, key=lambda c: EXTRA_RELATIONS.index(c[0])):
+            if rid in seen:
+                continue
+            if fetched >= MAX_EXTRA_FETCH:
+                break
+            fetched += 1
+            e = await self.get_entry(rid)
+            if e and (e.type in SPECIAL_TYPES or e.type == "TV Special"):
+                if e.parent_id is None:
+                    e.parent_id = found_from
+                seen[rid] = e
+
+        for e in seen.values():        # OVAs reached through the sequel chain: use their declared parent
+            if e.type in SPECIAL_TYPES and e.parent_id is None:
+                e.parent_id = next((pid for pid in e.parents if pid in seen), None)
+
         entries = sorted(seen.values(), key=lambda e: (e.aired_from or "9999", e.mal_id))
         return entries, truncated
 
@@ -182,6 +228,8 @@ _NUM_WORDS = {"first": 1, "second": 2, "third": 3, "fourth": 4, "fifth": 5,
 _ROMAN = {"ii": 2, "iii": 3, "iv": 4, "vi": 6, "vii": 7, "viii": 8, "ix": 9}
 _FILLER = {"season", "part", "cour", "the"}
 _LANG_TAG = re.compile(r"\((?:sub|dub)\)", re.I)
+_TYPE_SYNONYMS = {"oad": "ova", "oav": "ova", "specials": "special", "sp": "special"}
+_TYPE_WORDS = {"ova", "special"}
 
 
 def _tokens(title: str) -> list:
@@ -210,6 +258,7 @@ def _split_title(title: str):
     """-> (core words, set of season markers)"""
     core, markers = [], set()
     for tok in _tokens(title):
+        tok = _TYPE_SYNONYMS.get(tok, tok)      # "OAD" / "Specials" / "SP" compare equal to "OVA" / "Special"
         mk = _marker(tok)
         if mk is not None:
             markers.add(mk)
@@ -249,10 +298,11 @@ def expected_titles(e: Entry) -> list:
 @dataclass
 class PlanItem:
     entry: Entry
-    kind: str          # "season" | "movie" | "skip"
+    kind: str          # "season" | "movie" | "special" | "skip"
     season: int = 0
     series: str = ""   # folder (series) this item belongs to
     year: Optional[int] = None
+    ep_offset: int = 0  # specials: S00 numbers start after this (episodes of earlier specials)
 
 
 @dataclass
@@ -264,7 +314,10 @@ class Plan:
 
     @property
     def selectable(self) -> list:
-        return [p for p in self.items if p.kind != "skip"][:MAX_SELECTABLE]
+        # seasons/movies first so the 25-option dropdown cuts off extras, not the main show
+        main = [p for p in self.items if p.kind not in ("skip", "special")]
+        extra = [p for p in self.items if p.kind == "special"]
+        return (main + extra)[:MAX_SELECTABLE]
 
     @property
     def title(self) -> str:
@@ -272,18 +325,50 @@ class Plan:
         return (focus.series if focus and focus.series else None) or (self.items[0].series if self.items else "Unknown")
 
 
+def _special_home(e: Entry, items: list, groups: list, idx: int):
+    """(series, year) an OVA/special should be filed under."""
+    # 1. the entry it was found under (side story of season 2 -> season 2's series)
+    if e.parent_id:
+        for p in items:
+            if p.entry.mal_id == e.parent_id and p.kind == "season":
+                return p.series, p.year
+    # 2. title prefix: "Fate/Zero OVA" belongs to the group whose key is "fate zero"
+    best = None
+    for t in (e.title_en, e.title):
+        words = [w for w in _split_title(t or "")[0] if w not in _TYPE_WORDS]
+        text = " ".join(words) + " "
+        for g in groups:
+            for key in g["keys"]:
+                if text.startswith(key + " ") and (best is None or len(key) > len(best[0])):
+                    best = (key, g)
+    if best:
+        return best[1]["first"].display, best[1]["first"].year
+    # 3. nearest season by air date: the one before, else the first
+    before = [p for p in items[:idx] if p.kind == "season"]
+    if before:
+        return before[-1].series, before[-1].year
+    first = next(p for p in items if p.kind == "season")
+    return first.series, first.year
+
+
 def build_plan(entries: list, focus_id: int, truncated: bool = False, mode: str = "split") -> Plan:
-    """TV/ONA entries become seasons, movies stay movies, OVAs/specials/unaired are skipped.
+    """TV/ONA entries become seasons, movies stay movies, OVAs/specials go to the series' Specials.
 
     split: entries whose titles differ beyond a season marker (Fate/Zero vs Fate/stay night,
            Nisemonogatari vs Bakemonogatari) become separate series, numbered from season 1.
     merge: everything is one series, seasons numbered in air-date order.
+    A franchise made only of OVAs/specials has no series to hang them on, so they become
+    seasons of one series instead.
     """
     items: list[PlanItem] = []
     groups: list[dict] = []
+    specials: list[int] = []            # indexes into items, in air order
     for e in entries:
         if e.status == "Not yet aired" or not e.type:
             items.append(PlanItem(e, "skip"))
+        elif e.type in SPECIAL_TYPES or (e.type == "TV Special" and e.parent_id):
+            specials.append(len(items))
+            items.append(PlanItem(e, "special", 0))
         elif e.type == "TV Special":
             items.append(PlanItem(e, "season", 1, e.display, e.year))
         elif e.type in ("TV", "ONA"):
@@ -301,5 +386,20 @@ def build_plan(entries: list, focus_id: int, truncated: bool = False, mode: str 
         elif e.type == "Movie":
             items.append(PlanItem(e, "movie", 0, e.display, e.year))
         else:
-            items.append(PlanItem(e, "skip"))
+            items.append(PlanItem(e, "skip"))        # Music, PV, CM, ...
+
+    if specials and not any(p.kind == "season" for p in items):
+        first = items[specials[0]].entry
+        for n, idx in enumerate(specials, 1):
+            it = items[idx]
+            it.kind, it.season, it.series, it.year = "season", n, first.display, first.year
+        specials = []
+
+    counters: dict = {}
+    for idx in specials:
+        it = items[idx]
+        it.series, it.year = _special_home(it.entry, items, groups, idx)
+        key = it.series.casefold()
+        it.ep_offset = counters.get(key, 0)
+        counters[key] = it.ep_offset + (it.entry.episodes or 1)
     return Plan(items=items, focus_id=focus_id, truncated=truncated, mode=mode)
