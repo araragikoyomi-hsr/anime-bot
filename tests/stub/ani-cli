@@ -1,0 +1,20 @@
+#!/usr/bin/env bash
+# Minimal ani-cli stand-in for tests:  ani-cli -d -e <ep|"N -1"> -q Q -S N [--dub] "<query>"
+# STUB_CLIP     path of a valid mp4 to copy (else a few bytes are written)
+# STUB_TITLE    source title used in the file names (default "Show")
+# STUB_MAX      last episode for open-ended ranges (default 2)
+# STUB_DECIMALS space-separated extra episode numbers emitted on open-ended runs, e.g. "1.5"
+ep=""; q=""
+while (($#)); do case $1 in -e) ep=$2; shift 2;; -q|-S) shift 2;; -d|--dub) shift;; *) q=$1; shift;; esac; done
+title=${STUB_TITLE:-Show}
+first=${ep%% *}; last=${ep##* }
+open=0; [[ $last == -1 ]] && { last=${STUB_MAX:-2}; open=1; }
+[[ $first == "$last" ]] && last=$first
+mk() {
+    local n=$1 f="$ANI_CLI_DOWNLOAD_DIR/$title Episode $1.mp4"
+    if [[ -n ${STUB_CLIP:-} ]]; then cp "$STUB_CLIP" "$f"; else echo data > "$f"; fi
+    echo "Downloading $title episode $n"
+}
+for ((i = first; i <= last; i++)); do mk "$i"; done
+((open)) && for d in ${STUB_DECIMALS:-}; do mk "$d"; done
+exit 0

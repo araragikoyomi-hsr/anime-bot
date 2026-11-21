@@ -171,13 +171,19 @@ class Tenrai:
             raise MalError("I only understand MyAnimeList and AniList links (or just type a title).")
         return "search", await self.search(text)
 
-    async def franchise(self, start_id: int):
+    async def franchise(self, start_id: int, progress=None):
         """Every entry connected to start_id, oldest first.
 
         The backbone is the Prequel/Sequel chain. OVAs and specials are usually attached by
         other relations (Side story / Other / Parent story), so those are looked up too and
         kept only if they turn out to be OVA/Special/TV Special entries.
+
+        progress: optional async callback(found_count, stage_text) for a live loading message.
         """
+        async def tick(text: str) -> None:
+            if progress:
+                await progress(len(seen), text)
+
         seen: dict[int, Entry] = {}
         todo = [start_id]
         candidates: list = []          # (relation, mal_id, found_from)
@@ -195,6 +201,7 @@ class Tenrai:
                     raise MalError("MAL doesn't have an anime with that ID.")
                 continue
             seen[mid] = e
+            await tick(e.display)
             todo.extend(rid for _, rid in e.relations if rid not in seen)
             if mid == start_id and e.type in (SPECIAL_TYPES | {"TV Special"}):
                 # started from an OVA/special: walk up to the series it belongs to
@@ -208,11 +215,14 @@ class Tenrai:
             if fetched >= MAX_EXTRA_FETCH:
                 break
             fetched += 1
+            if fetched == 1:
+                await tick("looking for OVAs and specials")
             e = await self.get_entry(rid)
             if e and (e.type in SPECIAL_TYPES or e.type == "TV Special"):
                 if e.parent_id is None:
                     e.parent_id = found_from
                 seen[rid] = e
+                await tick(e.display)
 
         for e in seen.values():        # OVAs reached through the sequel chain: use their declared parent
             if e.type in SPECIAL_TYPES and e.parent_id is None:
