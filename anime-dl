@@ -1,0 +1,459 @@
+#!/usr/bin/env bash
+#
+# anime-dl - resumable ani-cli wrapper that organizes episodes for Plex/Jellyfin
+#
+# Re-running the same command always resumes: finished episodes are skipped,
+# partial downloads continue from where they stopped.
+#
+# Usage:
+#   anime-dl                                   interactive prompts
+#   anime-dl -n "Name" -y 2008 -s 1 -e all     fully non-interactive
+#   anime-dl -n "Name" -e 23-24 -q 1080
+#   anime-dl -n "Name" -e 1,3,5-7 --dry-run
+#
+# Run `anime-dl --help` for all options.
+
+set -uo pipefail
+
+BASE="${ANIME_BASE:-/srv/media/anime}"
+RETRIES="${ANIME_RETRIES:-3}"
+MIN_FREE_GB="${ANIME_MIN_FREE_GB:-5}"
+MAX_CONSEC_FAIL="${ANIME_MAX_CONSEC_FAIL:-2}"
+SUB_LANG="${ANIME_SUB_LANG:-en}"
+
+NAME="" SEARCH="" YEAR="" SEASON="" EPSPEC="" QUALITY="" AUDIO="" PICK="" DRY=0
+INTERACTIVE=0
+
+usage() {
+    cat <<EOF
+Usage: ${0##*/} [options]
+
+  -n, --name NAME      Anime name (search query for ani-cli)
+  -Q, --search TERM    Search term for ani-cli if different from the name
+                       (sequels often need e.g. "Name II"; folder keeps NAME)
+  -y, --year YEAR      Release year (used in the folder name)
+  -s, --season N|next  Season number (default 1); "next" = last season in
+                       your library + 1 (same as --next)
+      --next           Shortcut for --season next
+  -e, --episodes SPEC  all | 5 | 1-12 | 1,3,5-7 | 13-   (default all)
+  -q, --quality Q      best|1080|720|480|360 (default best)
+      --dub            Download the dub instead of the sub
+  -S, --pick N         Which ani-cli search result to use (default 1)
+      --dry-run        Show what is already in the library and what is missing
+  -h, --help           Show this help
+
+Environment overrides:
+  ANIME_BASE (default /srv/media/anime)   ANIME_RETRIES (default 3)
+  ANIME_MIN_FREE_GB (default 5)           ANIME_SUB_LANG (default en)
+  ANIME_MAX_CONSEC_FAIL (default 2)       give up on a list after this many failed
+                                          episodes in a row (wrong show / source down)
+
+Notes:
+  * "all" and "N-" download from the first missing episode onward.
+    Use explicit lists/ranges to fill gaps in the middle.
+  * Partial downloads are kept in $BASE/.anime-dl/ and resumed next run.
+EOF
+}
+
+die()  { echo "Error: $*" >&2; exit 1; }
+warn() { echo "Warning: $*" >&2; }
+log()  { printf '[%s] %s\n' "$(date +%H:%M:%S)" "$*"; }
+need() { (($# >= 2)) || die "$1 needs a value"; }
+safe() { sed -E 's#[/\\:*?"<>|]#_#g; s/[[:space:]]+/ /g; s/^ +| +$//g' <<<"$1"; }
+
+# Look at what is already in the library for this show: adopt an existing
+# folder's year if none was given, and work out which seasons exist.
+EXISTING_SEASONS=() LAST_SEASON=0 NEXT_SEASON=1
+detect_library() {
+    local cands c folder d s files summary=()
+    shopt -s nullglob
+    if [[ -z $YEAR ]]; then
+        cands=()
+        for c in "$BASE/$NAME_SAFE" "$BASE/$NAME_SAFE ("[0-9][0-9][0-9][0-9]")"; do
+            [[ -d $c ]] && cands+=("$c")   # the year-less path is a literal, so check it exists
+        done
+        if ((${#cands[@]} == 1)); then
+            c=${cands[0]##*/}
+            [[ $c =~ \(([0-9]{4})\)$ ]] && YEAR=${BASH_REMATCH[1]}
+            log "Found existing library folder: $c"
+        elif ((${#cands[@]} > 1)); then
+            printf 'Several library folders match "%s":\n' "$NAME_SAFE" >&2
+            printf '  %s\n' "${cands[@]##*/}" >&2
+            die "Pass --year (or enter a year) to choose which one to use."
+        fi
+    fi
+    folder="$NAME_SAFE"
+    [[ -n $YEAR ]] && folder="$NAME_SAFE ($YEAR)"
+    for d in "$BASE/$folder"/"Season "[0-9]*; do
+        [[ -d $d ]] || continue
+        s=${d##*/Season }
+        [[ $s =~ ^[0-9]+$ ]] || continue
+        files=("$d"/*.mp4 "$d"/*.mkv)
+        ((${#files[@]} > 0)) || continue
+        s=$((10#$s))
+        EXISTING_SEASONS+=("$s")
+        summary+=("Season $(printf '%02d' "$s") (${#files[@]} episodes)")
+        ((s > LAST_SEASON)) && LAST_SEASON=$s
+    done
+    NEXT_SEASON=$((LAST_SEASON + 1))
+    if ((${#summary[@]} > 0)); then
+        echo "Already in library for '$folder': $(IFS=,; echo "${summary[*]}" | sed 's/,/, /g')"
+        ((INTERACTIVE)) && echo "Press Enter for season $NEXT_SEASON, or type an existing season number to fill in missing episodes."
+    fi
+}
+
+# ---------------------------------------------------------------- arguments
+while (($#)); do
+    case $1 in
+        -n|--name)     need "$@"; NAME=$2;    shift 2 ;;
+        -Q|--search)   need "$@"; SEARCH=$2;  shift 2 ;;
+        -y|--year)     need "$@"; YEAR=$2;    shift 2 ;;
+        --next)        SEASON=next; shift ;;
+        -s|--season)   need "$@"; SEASON=$2;  shift 2 ;;
+        -e|--episodes) need "$@"; EPSPEC=$2;  shift 2 ;;
+        -q|--quality)  need "$@"; QUALITY=$2; shift 2 ;;
+        -S|--pick)     need "$@"; PICK=$2;    shift 2 ;;
+        --dub)         AUDIO=dub; shift ;;
+        --dry-run)     DRY=1; shift ;;
+        -h|--help)     usage; exit 0 ;;
+        *) usage >&2; die "Unknown option: $1" ;;
+    esac
+done
+
+# ------------------------------------------------------------- dependencies
+command -v ani-cli >/dev/null 2>&1 || die "ani-cli is not installed."
+command -v flock   >/dev/null 2>&1 || die "flock is required (util-linux)."
+HAVE_FFPROBE=0
+command -v ffprobe >/dev/null 2>&1 && HAVE_FFPROBE=1
+((HAVE_FFPROBE)) || warn "ffprobe not found - corrupt files won't be detected (install ffmpeg)."
+
+# ------------------------------------------------------------------ prompts
+ask() {  # ask VAR "Prompt" "default"
+    local __var=$1 __ans=""
+    [[ -t 0 ]] && read -rp "$2" __ans
+    printf -v "$__var" '%s' "${__ans:-${3:-}}"
+}
+
+if [[ -z $NAME ]]; then
+    INTERACTIVE=1
+    ask NAME "Anime name: "
+fi
+[[ -n $NAME ]] || die "Anime name is required."
+NAME_SAFE=$(safe "$NAME")
+
+if ((INTERACTIVE)); then
+    [[ -z $YEAR ]] && ask YEAR "Release year (optional): "
+fi
+
+detect_library
+
+if ((INTERACTIVE)); then
+    [[ -z $SEASON ]] && ask SEASON "Season number [$NEXT_SEASON]: " "$NEXT_SEASON"
+    [[ -z $SEARCH ]] && ask SEARCH "Search term for ani-cli [$NAME] (sequels often differ, e.g. \"$NAME II\"): " "$NAME"
+    [[ -z $EPSPEC  ]] && ask EPSPEC  "Episodes [all] (e.g. all, 5, 1-12, 1,3,7-9, 13-): " all
+    [[ -z $QUALITY ]] && ask QUALITY "Quality [best/1080/720/480]: " best
+    [[ -z $AUDIO   ]] && ask AUDIO   "Audio [sub/dub]: " sub
+    [[ -z $PICK    ]] && ask PICK    "Search result number [1] (see: ani-cli \"${SEARCH:-$NAME}\"): " 1
+fi
+
+SEASON=${SEASON:-1}
+[[ $SEASON == next ]] && SEASON=$NEXT_SEASON
+SEARCH=${SEARCH:-$NAME}
+EPSPEC=${EPSPEC:-all}
+QUALITY=${QUALITY:-best}
+AUDIO=${AUDIO:-sub}
+PICK=${PICK:-1}
+
+[[ $SEASON =~ ^[0-9]+$ ]]        || die "Invalid season number."
+[[ -z $YEAR || $YEAR =~ ^[0-9]{4}$ ]] || die "Invalid year (use 4 digits)."
+[[ $PICK =~ ^[0-9]+$ ]]          || die "Invalid search result number."
+[[ $RETRIES =~ ^[0-9]+$ ]] && ((RETRIES >= 1)) || die "ANIME_RETRIES must be >= 1."
+case $QUALITY in best|1080|720|480|360) ;; *) die "Invalid quality: $QUALITY" ;; esac
+case $AUDIO   in sub|dub) ;; *) die "Audio must be sub or dub." ;; esac
+
+# ----------------------------------------------------------- episode parsing
+EPS=() OPEN_FROM=""
+parse_eps() {
+    local spec=${1,,} part a b i parts
+    spec=${spec// /,}
+    if [[ $spec == all ]]; then OPEN_FROM=1; return; fi
+    IFS=, read -ra parts <<<"$spec"
+    for part in "${parts[@]}"; do
+        [[ -z $part ]] && continue
+        if [[ $part =~ ^[0-9]+$ ]]; then
+            EPS+=("$((10#$part))")
+        elif [[ $part =~ ^([0-9]+)-([0-9]+)$ ]]; then
+            a=$((10#${BASH_REMATCH[1]})); b=$((10#${BASH_REMATCH[2]}))
+            ((a <= b)) || die "Bad range: $part"
+            for ((i = a; i <= b; i++)); do EPS+=("$i"); done
+        elif [[ $part =~ ^([0-9]+)-$ ]]; then
+            OPEN_FROM=$((10#${BASH_REMATCH[1]}))
+        else
+            die "Bad episode spec: '$part'"
+        fi
+    done
+    if [[ -n $OPEN_FROM && ${#EPS[@]} -gt 0 ]]; then
+        die "Can't mix open-ended (all / N-) with explicit episodes."
+    fi
+    [[ -n $OPEN_FROM || ${#EPS[@]} -gt 0 ]] || die "No episodes selected."
+}
+parse_eps "$EPSPEC"
+
+# -------------------------------------------------------------------- paths
+FOLDER="$NAME_SAFE"
+[[ -n $YEAR ]] && FOLDER="$NAME_SAFE ($YEAR)"
+printf -v SEASON_NUM '%02d' "$((10#$SEASON))"
+
+DEST="$BASE/$FOLDER/Season $SEASON_NUM"
+STAGE_ROOT="$BASE/.anime-dl"              # same filesystem as library => mv is instant
+SLUG="${FOLDER// /_}-S$SEASON_NUM"
+STAGE="$STAGE_ROOT/$SLUG"
+LOCK="$STAGE_ROOT/$SLUG.lock"
+
+# ------------------------------------------------------------------ helpers
+have_ep() {  # is episode $1 already in the library?
+    local n=$1 e ext
+    printf -v e '%02d' "$n"
+    for ext in mp4 mkv; do
+        [[ -e "$DEST/$NAME_SAFE - S${SEASON_NUM}E$e.$ext" ]] && return 0
+    done
+    return 1
+}
+
+first_missing() {
+    local n=$1
+    while have_ep "$n"; do n=$((n + 1)); done
+    echo "$n"
+}
+
+has_partial_markers() {  # yt-dlp resume state present for file $1?
+    local f=$1 parts
+    [[ -e $f.ytdl ]] && return 0
+    shopt -s nullglob
+    parts=("$f".part*)
+    ((${#parts[@]} > 0))
+}
+
+is_complete() {
+    local f=$1
+    [[ -s $f ]] || return 1
+    has_partial_markers "$f" && return 1
+    if ((HAVE_FFPROBE)); then
+        ffprobe -v error -show_entries format=duration -of csv=p=0 "$f" >/dev/null 2>&1 || return 1
+    fi
+    return 0
+}
+
+prep_file() {  # make sure a staged mp4 can't trick yt-dlp into skipping/mis-resuming
+    local f=$1
+    [[ -e $f ]] || return 0
+    if has_partial_markers "$f"; then
+        # a bare .mp4 next to .part files makes yt-dlp think it's done; set it aside
+        mv -- "$f" "$f.stale"
+        log "Set aside stale file, resuming from partial data: ${f##*/}"
+    elif ! is_complete "$f"; then
+        mv -- "$f" "$f.corrupt"
+        log "Corrupt file set aside, will redownload: ${f##*/}"
+    fi
+}
+
+staged_incomplete() {  # any resume state left in staging?
+    local left
+    shopt -s nullglob
+    left=("$STAGE"/*.part* "$STAGE"/*.ytdl)
+    ((${#left[@]} > 0))
+}
+
+prep_episode() {
+    local f
+    shopt -s nullglob
+    for f in "$STAGE"/*"Episode $1.mp4"; do prep_file "$f"; done
+}
+
+prep_all() {
+    local f
+    shopt -s nullglob
+    for f in "$STAGE"/*.mp4; do prep_file "$f"; done
+}
+
+TOTAL_MOVED=0
+LAST_SRC_TITLE=""
+organize() {  # move every COMPLETE staged episode into the library
+    local f base ep ep_num stem sub ext
+    shopt -s nullglob
+    for f in "$STAGE"/*.mp4; do
+        base=${f##*/}
+        if [[ ! $base =~ ^(.*)[[:space:]][Ee]pisode[[:space:]_-]*([0-9]+)\.mp4$ ]]; then
+            warn "Unrecognized filename left in staging: $base"
+            continue
+        fi
+        src_title=${BASH_REMATCH[1]}
+        ep=$((10#${BASH_REMATCH[2]}))
+        printf -v ep_num '%02d' "$ep"
+        stem="$NAME_SAFE - S${SEASON_NUM}E${ep_num}"
+
+        is_complete "$f" || continue
+
+        if have_ep "$ep"; then
+            log "Already in library, dropping staged duplicate: $stem"
+            rm -f -- "$f" "${f%.mp4}".{vtt,srt,ass}
+            continue
+        fi
+
+        if [[ $src_title != "$LAST_SRC_TITLE" ]]; then
+            log "Source title: $src_title"       # lets wrappers verify the right show was matched
+            LAST_SRC_TITLE=$src_title
+        fi
+        mkdir -p "$DEST"
+        mv -- "$f" "$DEST/$stem.mp4" || { warn "Failed to move $base"; continue; }
+        for ext in vtt srt ass; do
+            sub="${f%.mp4}.$ext"
+            [[ -e $sub ]] && mv -- "$sub" "$DEST/$stem.$SUB_LANG.$ext"
+        done
+        rm -f -- "$f.stale" "$f.corrupt"
+        log "Organized: $stem"
+        TOTAL_MOVED=$((TOTAL_MOVED + 1))
+    done
+}
+
+run_ani() {  # run_ani "<episode spec>"
+    local args=(-d -e "$1" -q "$QUALITY" -S "$PICK")
+    [[ $AUDIO == dub ]] && args+=(--dub)
+    ANI_CLI_DOWNLOAD_DIR="$STAGE" ani-cli "${args[@]}" "$SEARCH"
+}
+
+# ----------------------------------------------------------------- dry run
+if ((DRY)); then
+    echo "Library: $DEST"
+    if [[ -n $OPEN_FROM ]]; then
+        echo "Would download from episode $(first_missing "$OPEN_FROM") onward."
+    else
+        have=() miss=()
+        for ep in "${EPS[@]}"; do
+            if have_ep "$ep"; then have+=("$ep"); else miss+=("$ep"); fi
+        done
+        echo "Already have: ${have[*]:-none}"
+        echo "Missing:      ${miss[*]:-none}"
+    fi
+    exit 0
+fi
+
+# -------------------------------------------------------- environment checks
+mkdir -p "$STAGE" || die "Cannot create $STAGE"
+
+avail_kb=$(df -Pk "$BASE" | awk 'NR==2 {print $4}')
+if ((avail_kb < MIN_FREE_GB * 1024 * 1024)); then
+    die "Only $((avail_kb / 1024 / 1024)) GB free on $BASE (need $MIN_FREE_GB; set ANIME_MIN_FREE_GB to change)."
+fi
+
+if [[ -z ${TMUX:-} && -z ${STY:-} ]]; then
+    warn "Not inside tmux/screen - a dropped SSH session will interrupt the download."
+    warn "(Finished episodes are still saved, and re-running resumes the rest.)"
+fi
+
+# One instance per show/season
+exec 9>"$LOCK"
+flock -n 9 || die "Another anime-dl is already running for this show/season."
+
+# ------------------------------------------------- cleanup / signal handling
+finish() {
+    local rc=$?
+    trap - EXIT
+    echo
+    log "Saving any finished episodes before exit..."
+    organize
+    # remove staging dir only if nothing is left to resume
+    shopt -s nullglob dotglob
+    local left=("$STAGE"/*)
+    if ((${#left[@]} == 0)); then rmdir "$STAGE" 2>/dev/null; fi
+    rm -f -- "$LOCK"
+    exit "$rc"
+}
+trap finish EXIT
+trap 'exit 130' INT TERM HUP
+
+echo
+echo "================================"
+echo "Anime:       $NAME"
+echo "Season:      $SEASON_NUM"
+[[ $SEARCH != "$NAME" ]] && echo "Search term: $SEARCH"
+echo "Quality:     $QUALITY ($AUDIO)"
+echo "Result pick: #$PICK"
+echo "Episodes:    ${OPEN_FROM:+from $OPEN_FROM onward}${EPS[*]:-}"
+echo "Destination: $DEST"
+echo "Staging:     $STAGE"
+echo "================================"
+echo
+
+# Rescue anything left over from an earlier interrupted run
+prep_all
+organize
+
+# ----------------------------------------------------------------- download
+FAILED=()
+
+if [[ -n $OPEN_FROM ]]; then
+    # Open-ended: one batch from the first missing episode, retried on failure
+    ok=0
+    for ((a = 1; a <= RETRIES; a++)); do
+        start=$(first_missing "$OPEN_FROM")
+        prep_all
+        log "Downloading from episode $start onward (attempt $a/$RETRIES)"
+        run_ani "$start -1"
+        rc=$?
+        organize
+        if ((rc == 0)) && ! staged_incomplete; then ok=1; break; fi
+        if ((a < RETRIES)); then
+            log "Incomplete (ani-cli exit $rc). Retrying in $((a * 10))s (partial data kept)."
+            sleep $((a * 10))
+        fi
+    done
+    ((ok)) || FAILED+=("from-$(first_missing "$OPEN_FROM") (incomplete)")
+else
+    # Explicit list: one episode at a time, each with its own retries
+    consec=0
+    for ((idx = 0; idx < ${#EPS[@]}; idx++)); do
+        ep=${EPS[idx]}
+        if have_ep "$ep"; then
+            log "Skipping episode $ep (already in library)"
+            continue
+        fi
+        ok=0
+        for ((a = 1; a <= RETRIES; a++)); do
+            prep_episode "$ep"
+            log "Episode $ep (attempt $a/$RETRIES)"
+            run_ani "$ep"
+            organize
+            if have_ep "$ep"; then ok=1; break; fi
+            if ((a < RETRIES)); then
+                log "Episode $ep incomplete. Retrying in $((a * 10))s (partial data kept)."
+                sleep $((a * 10))
+            fi
+        done
+        if ((ok)); then
+            consec=0
+        else
+            FAILED+=("$ep")
+            consec=$((consec + 1))
+            if ((consec >= MAX_CONSEC_FAIL && idx + 1 < ${#EPS[@]})); then
+                warn "$consec episodes in a row failed - giving up on the rest (wrong show, or source down?)"
+                FAILED+=("${EPS[@]:idx+1}")
+                break
+            fi
+        fi
+    done
+fi
+
+# ------------------------------------------------------------------ summary
+echo
+echo "================================"
+echo "Organized this run: $TOTAL_MOVED"
+echo "Location: $DEST"
+if ((${#FAILED[@]} > 0)); then
+    echo "Failed/incomplete: ${FAILED[*]}"
+    echo "Partial data kept - run the same command again to resume."
+    echo "================================"
+    exit 1
+fi
+echo "All requested episodes are in the library."
+echo "================================"

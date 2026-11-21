@@ -1,0 +1,20 @@
+[Unit]
+Description=Anime download Discord bot
+After=network-online.target docker.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=shiki
+WorkingDirectory=/home/shiki/anime-bot
+EnvironmentFile=/home/shiki/anime-bot/.env
+# ani-cli, yt-dlp and ffmpeg must be on this PATH
+Environment=PATH=/home/shiki/.local/bin:/usr/local/bin:/usr/bin:/bin
+ExecStart=/home/shiki/anime-bot/.venv/bin/python bot.py
+Restart=on-failure
+RestartSec=10
+# On stop, anime-dl gets SIGTERM and saves any finished episodes first
+TimeoutStopSec=30
+
+[Install]
+WantedBy=multi-user.target
