@@ -279,36 +279,57 @@ prep_all() {
 TOTAL_MOVED=0
 LAST_SRC_TITLE=""
 organize() {  # move every COMPLETE staged episode into the library
-    local f base ep ep_num stem sub ext
+    local f base ep ep_num frac stem sub ext target_dir
     shopt -s nullglob
     for f in "$STAGE"/*.mp4; do
         base=${f##*/}
-        if [[ ! $base =~ ^(.*)[[:space:]][Ee]pisode[[:space:]_-]*([0-9]+)\.mp4$ ]]; then
-            warn "Unrecognized filename left in staging: $base"
+        if [[ ! $base =~ ^(.*)[[:space:]][Ee]pisode[[:space:]_-]*([0-9]+)(\.([0-9]+))?\.mp4$ ]]; then
+            has_partial_markers "$f" && continue          # still downloading: leave it alone
+            mkdir -p "$STAGE_ROOT/unrecognized"
+            if mv -- "$f" "$STAGE_ROOT/unrecognized/$base"; then
+                warn "Unrecognized filename moved to $STAGE_ROOT/unrecognized/: $base"
+            else
+                warn "Unrecognized filename left in staging: $base"
+            fi
             continue
         fi
         src_title=${BASH_REMATCH[1]}
         ep=$((10#${BASH_REMATCH[2]}))
-        printf -v ep_num '%02d' "$ep"
-        stem="$NAME_SAFE - S${SEASON_NUM}E${ep_num}"
+        frac=${BASH_REMATCH[4]:-}
 
         is_complete "$f" || continue
 
-        if have_ep "$ep"; then
-            log "Already in library, dropping staged duplicate: $stem"
-            rm -f -- "$f" "${f%.mp4}".{vtt,srt,ass}
-            continue
+        if [[ -n $frac ]]; then
+            # Fractional episodes (6.5 = recap/bonus) can't be an SxxEyy number. File them under
+            # Specials with a deterministic S00 number: season*10000 + episode*10 + first decimal.
+            printf -v ep_num '%d' "$((10#$SEASON * 10000 + ep * 10 + 10#${frac:0:1}))"
+            target_dir="$BASE/$FOLDER/Specials"
+            stem="$NAME_SAFE - S00E${ep_num} - Season $SEASON_NUM Episode $ep.$frac"
+            if [[ -e $target_dir/$stem.mp4 || -e $target_dir/$stem.mkv ]]; then
+                log "Already in library, dropping staged duplicate: $stem"
+                rm -f -- "$f" "${f%.mp4}".{vtt,srt,ass}
+                continue
+            fi
+        else
+            printf -v ep_num '%02d' "$ep"
+            target_dir=$DEST
+            stem="$NAME_SAFE - S${SEASON_NUM}E${ep_num}"
+            if have_ep "$ep"; then
+                log "Already in library, dropping staged duplicate: $stem"
+                rm -f -- "$f" "${f%.mp4}".{vtt,srt,ass}
+                continue
+            fi
         fi
 
         if [[ $src_title != "$LAST_SRC_TITLE" ]]; then
             log "Source title: $src_title"       # lets wrappers verify the right show was matched
             LAST_SRC_TITLE=$src_title
         fi
-        mkdir -p "$DEST"
-        mv -- "$f" "$DEST/$stem.mp4" || { warn "Failed to move $base"; continue; }
+        mkdir -p "$target_dir"
+        mv -- "$f" "$target_dir/$stem.mp4" || { warn "Failed to move $base"; continue; }
         for ext in vtt srt ass; do
             sub="${f%.mp4}.$ext"
-            [[ -e $sub ]] && mv -- "$sub" "$DEST/$stem.$SUB_LANG.$ext"
+            [[ -e $sub ]] && mv -- "$sub" "$target_dir/$stem.$SUB_LANG.$ext"
         done
         rm -f -- "$f.stale" "$f.corrupt"
         log "Organized: $stem"

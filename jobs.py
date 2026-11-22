@@ -5,6 +5,7 @@ import asyncio
 import os
 import re
 import shutil
+import time
 from collections import deque
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -12,6 +13,7 @@ from typing import Optional
 
 import aiohttp
 
+from checks import free_gb
 from mal import MAX_TERMS, Entry, Plan, PlanItem, expected_titles, titles_match
 
 VIDEO_EXT = (".mp4", ".mkv")
@@ -21,6 +23,17 @@ MAX_SPECIAL_PROBES = 6     # (search term, result pick) combos tried before givi
 
 
 # ------------------------------------------------------------------- config
+def _float(v, default: float) -> float:
+    try:
+        return float(v) if v not in (None, "") else default
+    except ValueError:
+        return default
+
+
+class DiskSpaceError(Exception):
+    """Not enough free space to start a download."""
+
+
 @dataclass
 class Config:
     anime_dl: str
@@ -29,6 +42,7 @@ class Config:
     work_dir: Path        # scratch space, must be on the same filesystem as the libraries
     jellyfin_url: Optional[str] = None
     jellyfin_key: Optional[str] = None
+    min_free_gb: float = 5.0    # refuse to start a download below this much free space
 
     @classmethod
     def from_env(cls) -> "Config":
@@ -40,6 +54,7 @@ class Config:
             work_dir=Path(e("WORK_DIR", "/srv/media/.anime-bot")),
             jellyfin_url=(e("JELLYFIN_URL") or "").rstrip("/") or None,
             jellyfin_key=e("JELLYFIN_API_KEY") or None,
+            min_free_gb=_float(e("MIN_FREE_GB"), 5.0),
         )
 
 
@@ -51,6 +66,40 @@ class ItemResult:
     want: Optional[int] = None
     note: str = ""
     tail: list = field(default_factory=list)   # last lines of anime-dl output (for failures)
+
+
+class Activity:
+    """What anime-dl is doing right now, parsed from its output (shown live in Discord)."""
+    EP_RE = re.compile(r"Episode (\d+) \(attempt (\d+)/(\d+)\)")
+    FROM_RE = re.compile(r"Downloading from episode (\d+) onward \(attempt (\d+)/(\d+)\)")
+    PCT_RE = re.compile(r"\[download\]\s+(\d{1,3}(?:\.\d+)?)%")
+
+    def __init__(self) -> None:
+        self.ep = ""
+        self.pct = ""
+
+    def feed(self, line: str) -> None:
+        m = self.EP_RE.search(line)
+        if m:
+            self.ep = f"ep {m[1]}" + (f" (try {m[2]}/{m[3]})" if m[2] != "1" else "")
+            self.pct = ""
+            return
+        m = self.FROM_RE.search(line)
+        if m:
+            self.ep = f"from ep {m[1]}" + (f" (try {m[2]}/{m[3]})" if m[2] != "1" else "")
+            self.pct = ""
+            return
+        m = self.PCT_RE.search(line)
+        if m:
+            self.pct = f"{float(m[1]):.0f}%"
+        elif "Organized:" in line:
+            self.pct = ""
+
+    def reset(self) -> None:
+        self.ep = self.pct = ""
+
+    def render(self) -> str:
+        return " · ".join(x for x in (self.ep, self.pct) if x)
 
 
 @dataclass
@@ -65,10 +114,15 @@ class Job:
     pick: int = 1
     search: Optional[str] = None
     verify: bool = True
+    exact: bool = False                 # ani-cli: only accept a search result with exactly this title
     results: dict = field(default_factory=dict)
     cancelled: bool = False
     proc: Optional[asyncio.subprocess.Process] = None
     status_msg: object = None
+    attempts: int = 0                   # times this job was started (survives restarts; stops crash loops)
+    started_at: float = 0.0             # unix time, 0 = not started
+    finished_at: float = 0.0
+    activity: Activity = field(default_factory=Activity)
 
     def __post_init__(self):
         for it in self.items:
@@ -208,6 +262,9 @@ def is_complete(have: int, want: Optional[int], status: str) -> bool:
 async def _run(cfg: Config, job: Job, args: list, env_extra: dict, tail: deque,
                titles: Optional[list] = None) -> int:
     env = {**os.environ, **env_extra}
+    env.setdefault("ANIME_MIN_FREE_GB", f"{cfg.min_free_gb:g}")
+    if job.exact:
+        env["ANI_CLI_EXACT"] = "1"
     proc = await asyncio.create_subprocess_exec(
         cfg.anime_dl, *args,
         stdin=asyncio.subprocess.DEVNULL,
@@ -229,6 +286,7 @@ async def _run(cfg: Config, job: Job, args: list, env_extra: dict, tail: deque,
                 if p.strip():
                     line = p.decode(errors="replace").strip()
                     tail.append(line)
+                    job.activity.feed(line)
                     m = SRC_RE.search(line)
                     if m and titles is not None:
                         titles.append(m.group(1).strip())
@@ -240,7 +298,7 @@ async def _run(cfg: Config, job: Job, args: list, env_extra: dict, tail: deque,
 def _failure_note(tail: deque) -> str:
     """Pick the most informative line from anime-dl's output (not the cleanup chatter)."""
     lines = [l for l in tail if l]
-    for pat in (r"no results", r"^error", r"not found|not released", r"giving up", r"failed"):
+    for pat in (r"no exact match", r"no results", r"^error", r"not found|not released", r"giving up", r"failed"):
         for l in reversed(lines):
             if re.search(pat, l, re.I):
                 return l[:120]
@@ -259,7 +317,15 @@ def _base_args(job: Job, name: str, year: Optional[int], season: int, term: str,
 
 
 # ---------------------------------------------------------------- downloads
+def check_space(cfg: Config) -> None:
+    free = free_gb(cfg.anime_dir)
+    if free < cfg.min_free_gb:
+        raise DiskSpaceError(f"only {free:.1f} GB free (need {cfg.min_free_gb:g}); free some space and re-run")
+
+
 async def download_item(cfg: Config, job: Job, item: PlanItem) -> None:
+    check_space(cfg)
+    job.activity.reset()
     if item.kind == "movie":
         await _download_movie(cfg, job, item)
     elif item.kind == "special":
